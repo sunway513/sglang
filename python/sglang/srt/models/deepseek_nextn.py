@@ -13,49 +13,85 @@
 # ==============================================================================
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
+
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm import _custom_ops as ops
 
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_utils import (
-    block_quant_to_tensor_quant,
-    normalize_e4m3fn_to_e4m3fnuz,
+from sglang.srt.configs.model_config import is_deepseek_nsa
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.nsa.utils import (
+    can_cp_split,
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
+    prepare_input_dp_with_cp_dsa,
 )
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization import Fp8Config
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import is_hip
+from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
-is_hip_ = is_hip()
+logger = logging.getLogger(__name__)
+
+
+_is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 class DeepseekModelNextN(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
+        if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
+            # refer to real DeepSeek V3 quant config
+            moe_quant_config_override = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[128, 128],
+            )
+        else:
+            moe_quant_config_override = None
+
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            logger.warning(
+                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
+            )
+            quant_config = None
+
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            use_attn_tp_group=is_dp_attention_enabled(),
+            prefix=add_prefix("embed_tokens", prefix),
         )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -63,12 +99,36 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
+        )
+
+        layer_name = "decoder"
+        if _is_npu and (
+            get_global_server_args().speculative_draft_model_path
+            == get_global_server_args().model_path
+        ):
+            layer_name = "layers." + str(config.num_hidden_layers)
+
         self.decoder = DeepseekV2DecoderLayer(
-            config, 0, quant_config=quant_config, is_nextn=True
+            config,
+            0,
+            quant_config=quant_config,
+            moe_quant_config_override=moe_quant_config_override,
+            is_nextn=True,
+            prefix=add_prefix(layer_name, prefix),
+            alt_stream=self.alt_stream,
         )
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        if self.nsa_enable_prefill_cp:
+            self.cp_size = get_attention_cp_size()
+        else:
+            self.cp_size = None
 
     def forward(
         self,
@@ -77,58 +137,105 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        zero_allocator = BumpAllocator(
+            buffer_size=2,
+            dtype=torch.float32,
+            device=(
+                input_embeds.device if input_embeds is not None else input_ids.device
+            ),
+        )
+
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
 
-        hidden_states = self.eh_proj(
-            torch.cat(
-                (
-                    self.enorm(hidden_states),
-                    self.hnorm(forward_batch.spec_info.hidden_states),
-                ),
-                dim=-1,
+        if hidden_states.shape[0] > 0:
+            hidden_states = self.eh_proj(
+                torch.cat(
+                    (
+                        self.enorm(hidden_states),
+                        self.hnorm(forward_batch.spec_info.hidden_states),
+                    ),
+                    dim=-1,
+                )
             )
-        )
 
+        if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
-        hidden_states, residual = self.decoder(
-            positions, hidden_states, forward_batch, residual
-        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states, residual = self.decoder(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+            )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            if residual is not None:
+                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            else:
+                hidden_states = self.shared_head.norm(hidden_states)
+
+            if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+                # allgather + rerrange
+                hidden_states = cp_all_gather_rerange_output(
+                    hidden_states,
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+
         return hidden_states
 
 
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
+    # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
+    # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4
+    # https://huggingface.co/amd/DeepSeek-R1-0528-MXFP4/blob/main/config.json
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "model.layers.61": "model.decoder",
+        },
+    )
+
     def __init__(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-
-        self.model = DeepseekModelNextN(config, quant_config)
-
-        if global_server_args_dict["enable_dp_attention"]:
-            self.model.shared_head.head = ReplicatedLinear(
-                config.hidden_size,
-                config.vocab_size,
-                bias=False,
-            )
-            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
+        # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
+        self.pp_group = get_pp_group()
+        self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
+        self.use_nsa = is_deepseek_nsa(config)
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        if self.nsa_enable_prefill_cp:
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
         else:
-            self.model.shared_head.head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-            )
-            self.logits_processor = LogitsProcessor(config)
+            self.cp_rank = None
+            self.cp_size = None
+
+        self.model = DeepseekModelNextN(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("model.shared_head.head", prefix),
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+        )
+        self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
     def forward(
@@ -137,159 +244,22 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+        if self.nsa_enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
-            input_ids, hidden_states, self.model.shared_head.head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        if hasattr(self.config, "num_nextn_predict_layers"):
-            num_nextn_layers = self.config.num_nextn_predict_layers
-            assert num_nextn_layers == 1, "Only 1 nextn layer is supportted"
-            assert num_nextn_layers == self.config.num_hidden_layers
-        else:
-            raise ValueError("num_nextn_predict_layers is not in the config")
-
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
-        expert_params_mapping = MoEImpl.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
-        )
-
-        nextn_layer_prefix = "model.layers.0"
-        nextn_spec_weight_names = [
-            "shared_head.head",
-            "shared_head.norm",
-            "eh_proj",
-            "embed_tokens",
-            "enorm",
-            "hnorm",
-        ]
-
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if not name.startswith(nextn_layer_prefix):
-                continue
-            else:
-                is_decoder = True
-                # For nextn specific weights
-                for weight_name in nextn_spec_weight_names:
-                    if weight_name in name:
-                        name = name.replace(nextn_layer_prefix, "model")
-                        is_decoder = False
-                        break
-                # For decoder layer weights
-                if is_decoder:
-                    name = name.replace(nextn_layer_prefix, "model.decoder")
-
-            if "rotary_emb.inv_freq" in name:
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
-                    continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and name not in params_dict:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-
-        if not global_server_args_dict["disable_mla"]:
-            self_attn = self.model.decoder.self_attn
-            if hasattr(self_attn.kv_b_proj, "qweight"):
-                # AWQ compatible
-                w = ops.awq_dequantize(
-                    self_attn.kv_b_proj.qweight,
-                    self_attn.kv_b_proj.scales,
-                    self_attn.kv_b_proj.qzeros,
-                    0,
-                    0,
-                    0,
-                ).T
-            else:
-                w = self_attn.kv_b_proj.weight
-            # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
-            # This may affect the accuracy of fp8 model.
-            if hasattr(self.quant_config, "weight_block_size") and w.dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-            ):
-                weight_block_size = self.quant_config.weight_block_size
-                if weight_block_size is not None:
-                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                    if is_hip_:
-                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                            weight=w,
-                            weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-                            input_scale=None,
-                        )
-                    else:
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
-
-                    w, scale = block_quant_to_tensor_quant(
-                        weight, weight_scale, weight_block_size
-                    )
-                    self_attn.w_scale = scale
-            w_kc, w_vc = w.unflatten(
-                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-            if (
-                hasattr(self_attn.kv_b_proj, "weight_scale")
-                and self_attn.w_scale is None
-            ):
-                self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-                if is_hip_:
-                    self_attn.w_scale *= 2.0
+        super().load_weights(weights, is_nextn=True)
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

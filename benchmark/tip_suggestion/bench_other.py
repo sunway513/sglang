@@ -13,8 +13,7 @@ number = 5
 
 
 def expand_tip(topic, tip, generate):
-    s = (
-        """Please expand a tip for a topic into a detailed paragraph.
+    s = """Please expand a tip for a topic into a detailed paragraph.
 
 Topic: staying healthy
 Tip: Regular Exercise
@@ -28,12 +27,7 @@ Topic: writing a blog post
 Tip: structure your content effectively
 Paragraph: A well-structured post is easier to read and more enjoyable. Start with an engaging introduction that hooks the reader and clearly states the purpose of your post. Use headings and subheadings to break up the text and guide readers through your content. Bullet points and numbered lists can make information more digestible. Ensure each paragraph flows logically into the next, and conclude with a summary or call-to-action that encourages reader engagement.
 
-Topic: """
-        + topic
-        + "\nTip: "
-        + tip
-        + "\nParagraph:"
-    )
+Topic: """ + topic + "\nTip: " + tip + "\nParagraph:"
     return generate(s, max_tokens=128, stop=["\n\n"])
 
 
@@ -68,7 +62,7 @@ def main(args):
     call_generate = partial(get_call_generate(args), temperature=0)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     if args.backend != "lmql":
 
         def get_one_answer(i):
@@ -102,7 +96,7 @@ def main(args):
             loop.run_until_complete(
                 asyncio.gather(*[get_one_answer_async(i) for i in batch])
             )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     print(f"Latency: {latency:.3f}")

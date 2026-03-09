@@ -24,6 +24,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    fused_moe_npu,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -33,7 +36,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton import fused_moe
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -43,6 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix, is_npu
 
 
 class XverseMLP(nn.Module):
@@ -54,10 +60,15 @@ class XverseMLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -65,6 +76,7 @@ class XverseMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -86,6 +98,7 @@ class XverseMoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -107,14 +120,24 @@ class XverseMoE(nn.Module):
                     hidden_act=config.hidden_act,
                     quant_config=quant_config,
                     reduce_results=False,
+                    prefix=add_prefix(f"experts.{i}", prefix),
                 )
-                for _ in range(self.n_routed_experts)
+                for i in range(self.n_routed_experts)
             ]
         )
         self.pack_params()
+        self.moe_runner_config = MoeRunnerConfig(inplace=True)
 
         self.router = ReplicatedLinear(
-            config.hidden_size, self.n_routed_experts, bias=False, quant_config=None
+            config.hidden_size,
+            self.n_routed_experts,
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("router", prefix),
+        )
+        self.topk = TopK(
+            top_k=self.top_k,
+            renormalize=getattr(self.config, "norm_topk_prob", False),
         )
 
         if config.num_shared_experts is not None:
@@ -125,7 +148,9 @@ class XverseMoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                prefix=add_prefix("shared_experts", prefix),
             )
+        self.fused_moe_method = fused_moe if not is_npu() else fused_moe_npu
 
     def pack_params(self):
         w1 = []
@@ -153,14 +178,13 @@ class XverseMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.router(hidden_states)
-        final_hidden_states = fused_moe(
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.fused_moe_method(
             hidden_states,
             self.w1,
             self.w2,
-            router_logits,
-            self.top_k,
-            renormalize=getattr(self.config, "norm_topk_prob", False),
-            inplace=True,
+            topk_output,
+            self.moe_runner_config,
         )
 
         if self.config.num_shared_experts is not None:
@@ -182,6 +206,7 @@ class XverseAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -213,6 +238,7 @@ class XverseAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
         )
 
         self.o_proj = RowParallelLinear(
@@ -220,6 +246,7 @@ class XverseAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
         )
 
         self.rotary_emb = get_rope(
@@ -235,6 +262,8 @@ class XverseAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -258,6 +287,7 @@ class XverseDecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -276,15 +306,21 @@ class XverseDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
         )
         if config.num_experts is not None:
-            self.mlp = XverseMoE(config=config, quant_config=quant_config)
+            self.mlp = XverseMoE(
+                config=config,
+                quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
+            )
         else:
             self.mlp = XverseMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -324,6 +360,7 @@ class XverseModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -332,10 +369,16 @@ class XverseModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
-                XverseDecoderLayer(config, layer_id, quant_config=quant_config)
+                XverseDecoderLayer(
+                    config,
+                    layer_id,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{layer_id}", prefix),
+                )
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
@@ -364,13 +407,19 @@ class XverseMoeForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = XverseModel(config, quant_config)
+        self.model = XverseModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
         self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
 

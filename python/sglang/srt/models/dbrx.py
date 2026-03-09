@@ -32,7 +32,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton import fused_moe
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -46,7 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import add_prefix, set_weight_attrs
 
 
 class DbrxRouter(nn.Module):
@@ -58,6 +60,7 @@ class DbrxRouter(nn.Module):
         self,
         config: DbrxConfig,
         params_dtype: Optional[torch.dtype] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -89,6 +92,7 @@ class DbrxExperts(nn.Module):
         config: DbrxConfig,
         quant_config: Optional[QuantizationConfig] = None,
         params_dtype: Optional[torch.dtype] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -102,6 +106,11 @@ class DbrxExperts(nn.Module):
         self.params_dtype = params_dtype
 
         self.router = DbrxRouter(config, self.params_dtype)
+        self.topk = TopK(
+            self.top_k,
+            renormalize=True,
+        )
+        self.moe_runner_config = MoeRunnerConfig(inplace=True)
         self.ws = nn.Parameter(
             torch.empty(
                 self.num_total_experts,
@@ -167,14 +176,13 @@ class DbrxExperts(nn.Module):
         hidden_states = hidden_states.view(-1, self.d_model)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = fused_moe(
             hidden_states,
             self.ws,
             self.w2s,
-            router_logits,
-            self.top_k,
-            renormalize=True,
-            inplace=True,
+            topk_output,
+            self.moe_runner_config,
         )
 
         if self.tp_size > 1:
@@ -189,6 +197,7 @@ class DbrxAttention(nn.Module):
         config: DbrxConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.d_model = config.d_model
@@ -207,12 +216,14 @@ class DbrxAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("Wqkv", prefix),
         )
         self.out_proj = RowParallelLinear(
             self.d_model,
             self.d_model,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("out_proj", prefix),
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -244,6 +255,8 @@ class DbrxAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -268,10 +281,16 @@ class DbrxFusedNormAttention(nn.Module):
         config: DbrxConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.d_model = config.d_model
-        self.attn = DbrxAttention(config, layer_id, quant_config=quant_config)
+        self.attn = DbrxAttention(
+            config,
+            layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
+        )
         self.norm_1 = nn.LayerNorm(self.d_model)
         self.norm_2 = nn.LayerNorm(self.d_model)
 
@@ -280,7 +299,7 @@ class DbrxFusedNormAttention(nn.Module):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.norm_1(hidden_states)
         x = self.attn(
@@ -300,10 +319,14 @@ class DbrxBlock(nn.Module):
         config: DbrxConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.norm_attn_norm = DbrxFusedNormAttention(
-            config, layer_id, quant_config=quant_config
+            config,
+            layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("norm_attn_norm", prefix),
         )
         self.ffn = DbrxExperts(config, quant_config=quant_config)
 
@@ -328,6 +351,7 @@ class DbrxModel(nn.Module):
         self,
         config: DbrxConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.wte = VocabParallelEmbedding(
@@ -336,7 +360,12 @@ class DbrxModel(nn.Module):
         )
         self.blocks = nn.ModuleList(
             [
-                DbrxBlock(config, i, quant_config=quant_config)
+                DbrxBlock(
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"blocks.{i}", prefix),
+                )
                 for i in range(config.n_layers)
             ]
         )
@@ -369,17 +398,21 @@ class DbrxForCausalLM(nn.Module):
         self,
         config: DbrxConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
         self.unpadded_vocab_size = config.vocab_size
-        self.transformer = DbrxModel(config, quant_config=quant_config)
+        self.transformer = DbrxModel(
+            config, quant_config=quant_config, prefix=add_prefix("transformer", prefix)
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.d_model,
             org_num_embeddings=config.vocab_size,
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
+            prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
 

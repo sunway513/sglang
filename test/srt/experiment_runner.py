@@ -8,12 +8,12 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import psutil
-import requests
 import yaml
+
+from sglang.utils import wait_for_http_ready
 
 
 @dataclass
@@ -183,21 +183,23 @@ class ExperimentRunner:
         self.process_manager = ProcessManager()
         self.logger = logging.getLogger(__name__)
 
-    def wait_for_server(self, port: int, timeout: int = 300) -> bool:
-        start_time = time.time()
-
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(f"http://localhost:{port}/health")
-                if response.status_code == 200:
-                    self.logger.debug(f"Server ready on port {port}")
-                    return True
-            except requests.RequestException:
-                time.sleep(2)
-        return False
+    def wait_for_server(
+        self, port: int, timeout: int = 300, process: Optional[subprocess.Popen] = None
+    ) -> bool:
+        try:
+            wait_for_http_ready(
+                url=f"http://localhost:{port}/health",
+                timeout=timeout,
+                process=process,
+            )
+            self.logger.debug(f"Server ready on port {port}")
+            return True
+        except (RuntimeError, TimeoutError) as e:
+            self.logger.error("Server failed to become ready: %s", e)
+            return False
 
     def run_task(self, config: TaskConfig) -> TaskResult:
-        start_time = time.time()
+        start_time = time.perf_counter()
         client_output = []
 
         try:
@@ -217,7 +219,9 @@ class ExperimentRunner:
                 self.process_manager.start_process(config.server_cmd, "SERVER")
             )
 
-            if not self.wait_for_server(port):
+            if not self.wait_for_server(
+                port, process=self.process_manager.server_process
+            ):
                 raise TimeoutError("Server startup timeout")
 
             time.sleep(10)
@@ -247,7 +251,7 @@ class ExperimentRunner:
                 name=config.name,
                 success=True,
                 output=formatted_output,
-                runtime=time.time() - start_time,
+                runtime=time.perf_counter() - start_time,
                 timestamp=datetime.now().isoformat(),
             )
 
@@ -256,7 +260,7 @@ class ExperimentRunner:
                 name=config.name,
                 success=False,
                 output=str(e),
-                runtime=time.time() - start_time,
+                runtime=time.perf_counter() - start_time,
                 timestamp=datetime.now().isoformat(),
             )
 
@@ -317,6 +321,11 @@ def format_results(results: List[TaskResult]) -> str:
     return "\n".join(output)
 
 
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    return value.lower() in ("true", "1")
+
+
 def write_in_github_step_summary(results: List[TaskResult]):
     """Write formatted results to GitHub step summary."""
     if not os.environ.get("GITHUB_STEP_SUMMARY"):
@@ -349,7 +358,8 @@ def main():
             result = runner.run_task(config)
             results.append(result)
 
-        write_in_github_step_summary(results)
+        if get_bool_env_var("SGLANG_IS_IN_CI"):
+            write_in_github_step_summary(results)
     except Exception as e:
         logger.error(f"Error: {e}")
         raise

@@ -11,22 +11,21 @@ python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1
 """
 
 import argparse
+import asyncio
 import dataclasses
+import inspect
 import json
 import logging
 import os
 import random
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 
-from sglang.bench_serving import (
-    get_dataset,
-    get_tokenizer,
-    sample_random_requests,
-    set_ulimit,
-)
+from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets.random import sample_random_requests
+from sglang.benchmark.utils import get_tokenizer, set_ulimit
 from sglang.lang.backend.runtime_endpoint import Runtime
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs
@@ -56,6 +55,9 @@ class BenchArgs:
     profile: bool = False
     skip_warmup: bool = False
     do_not_exit: bool = False
+    prompt_suffix: str = ""
+    return_logprob: bool = False
+    logprob_start_len: int = -1
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -177,6 +179,23 @@ class BenchArgs:
             action="store_true",
             help="Do not exit the program. This is useful for nsys profile with --duration and --delay.",
         )
+        parser.add_argument(
+            "--prompt-suffix",
+            type=str,
+            default="",
+            help="Suffix applied to the end of all user prompts, followed by assistant prompt suffix.",
+        )
+        parser.add_argument(
+            "--return-logprob",
+            action="store_true",
+            help="Enable returning log probabilities.",
+        )
+        parser.add_argument(
+            "--logprob-start-len",
+            type=int,
+            default=-1,
+            help="Start length for logprob. -1 means only return logprobs for output tokens (default). 0 means return logprobs for all tokens including input.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -187,16 +206,18 @@ class BenchArgs:
 def throughput_test_once(
     backend_name: str,
     backend,
-    reqs: List[Tuple[str, int, int]],
+    reqs: List[DatasetRow],
     ignore_eos: bool,
     extra_request_body: Dict,
     profile: bool,
+    return_logprob: bool = False,
+    logprob_start_len: int = -1,
 ):
     measurement_results = {
         "backend": backend_name,
         "successful_requests": len(reqs),
         "total_latency": -1,
-        "total_input_tokens": sum(r[1] for r in reqs),
+        "total_input_tokens": sum(r.prompt_len for r in reqs),
         "total_output_tokens": -1,
         "request_throughput": -1,
         "input_throughput": -1,
@@ -204,11 +225,11 @@ def throughput_test_once(
         "total_throughput": -1,
     }
 
-    prompt = [r[0] for r in reqs]
+    prompt = [r.prompt for r in reqs]
     sampling_params = [
         {
             "temperature": 0,
-            "max_new_tokens": r[2],
+            "max_new_tokens": r.output_len,
             "ignore_eos": ignore_eos,
             **extra_request_body,
         }
@@ -216,18 +237,31 @@ def throughput_test_once(
     ]
 
     if profile:
+        assert (
+            "SGLANG_TORCH_PROFILER_DIR" in os.environ
+        ), "Please set SGLANG_TORCH_PROFILER_DIR."
+        os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
         backend.start_profile()
 
     st = time.perf_counter()
-    gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+    gen_out = backend.generate(
+        prompt=prompt,
+        sampling_params=sampling_params,
+        return_logprob=return_logprob,
+        logprob_start_len=logprob_start_len,
+    )
     latency = time.perf_counter() - st
 
     if profile:
+        dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+        known_files = set(os.listdir(dir))
         backend.stop_profile()
-        monitor_trace_file(os.getenv("SGLANG_TORCH_PROFILER_DIR"))
+        monitor_trace_file(known_files, dir)
 
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)
+
+    server_info = backend.get_server_info()
 
     measurement_results["total_latency"] = latency
     measurement_results["total_output_tokens"] = sum(
@@ -247,14 +281,18 @@ def throughput_test_once(
         + measurement_results["total_output_tokens"]
     ) / latency
 
+    if inspect.isawaitable(server_info):
+        server_info = asyncio.run(server_info)
+
+    measurement_results["last_gen_throughput"] = server_info["internal_states"][0][
+        "last_gen_throughput"
+    ]
+
     return measurement_results
 
 
-def monitor_trace_file(directory, interval=1):
-
+def monitor_trace_file(known_files, directory, interval=1):
     print(f"Monitoring {directory} for new trace files...")
-
-    known_files = set(os.listdir(directory))
 
     while True:
         flag = False
@@ -285,12 +323,83 @@ def monitor_trace_file(directory, interval=1):
             break
 
 
+def _create_ray_engine_backend(server_args: ServerArgs):
+    """Create a RayEngine inside a Ray actor on a placement group.
+
+    RayEngine requires a placement group, so we launch it inside a Ray actor
+    and return a lightweight proxy that forwards calls via ray.get().
+    """
+    import ray
+    from ray.runtime_env import RuntimeEnv
+    from ray.util.placement_group import placement_group
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+    env_vars = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
+    if os.environ.get("HF_TOKEN"):
+        env_vars["HF_TOKEN"] = os.environ["HF_TOKEN"]
+    if not ray.is_initialized():
+        ray.init(runtime_env=RuntimeEnv(env_vars=env_vars))
+
+    total_gpus = server_args.tp_size * server_args.pp_size
+    pg = placement_group([{"CPU": 1, "GPU": total_gpus}], strategy="STRICT_PACK")
+    ray.get(pg.ready())
+
+    @ray.remote
+    class _EngineActor:
+        def __init__(self, **kwargs):
+            from sglang.srt.ray.engine import RayEngine
+
+            self.engine = RayEngine(**kwargs)
+
+        def call(self, method, **kwargs):
+            return getattr(self.engine, method)(**kwargs)
+
+    actor = _EngineActor.options(
+        num_cpus=1,
+        num_gpus=0,
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=pg,
+            placement_group_bundle_index=0,
+        ),
+    ).remote(**dataclasses.asdict(server_args))
+
+    class _Proxy:
+        """Forwards method calls to the remote RayEngine actor."""
+
+        def generate(self, **kwargs):
+            return ray.get(actor.call.remote("generate", **kwargs))
+
+        def get_server_info(self, **kwargs):
+            return ray.get(actor.call.remote("get_server_info", **kwargs))
+
+        def start_profile(self, **kwargs):
+            return ray.get(actor.call.remote("start_profile", **kwargs))
+
+        def stop_profile(self, **kwargs):
+            return ray.get(actor.call.remote("stop_profile", **kwargs))
+
+        def shutdown(self):
+            try:
+                ray.get(actor.call.remote("shutdown"), timeout=60)
+            except Exception:
+                pass
+            try:
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                pass
+
+    return _Proxy()
+
+
 def throughput_test(
     server_args: ServerArgs,
     bench_args: BenchArgs,
 ):
     if bench_args.backend == "engine":
-        backend = Engine(**dataclasses.asdict(server_args))
+        if server_args.use_ray:
+            backend = _create_ray_engine_backend(server_args)
+        else:
+            backend = Engine(**dataclasses.asdict(server_args))
         if not backend:
             raise ValueError("Please provide valid engine arguments")
     elif bench_args.backend == "runtime":
@@ -301,7 +410,7 @@ def throughput_test(
     tokenizer_id = server_args.tokenizer_path or server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
-    # Set global environmnets
+    # Set global environments
     set_ulimit()
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)
@@ -333,6 +442,8 @@ def throughput_test(
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
             profile=False,
+            return_logprob=bench_args.return_logprob,
+            logprob_start_len=bench_args.logprob_start_len,
         )
         time.sleep(0.5)
 
@@ -344,6 +455,8 @@ def throughput_test(
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
+        return_logprob=bench_args.return_logprob,
+        logprob_start_len=bench_args.logprob_start_len,
     )
     backend.shutdown()
 
@@ -360,6 +473,11 @@ def throughput_test(
     print("{:<40} {:<10}".format("Total input tokens:", result["total_input_tokens"]))
     print(
         "{:<40} {:<10}".format("Total generated tokens:", result["total_output_tokens"])
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Last generation throughput (tok/s):", result["last_gen_throughput"]
+        )
     )
     print(
         "{:<40} {:<10.2f}".format(
@@ -391,6 +509,26 @@ if __name__ == "__main__":
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args()
+
+    # handling ModelScope model downloads
+    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() in ("true", "1"):
+        if os.path.exists(args.model_path):
+            print(f"Using local model path: {args.model_path}")
+        else:
+            try:
+                from modelscope import snapshot_download
+
+                print(f"Using ModelScope to download model: {args.model_path}")
+
+                # download the model and replace args.model_path
+                args.model_path = snapshot_download(
+                    args.model_path,
+                )
+                print(f"Model downloaded to: {args.model_path}")
+            except Exception as e:
+                print(f"ModelScope download failed: {str(e)}")
+                raise e
+
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 

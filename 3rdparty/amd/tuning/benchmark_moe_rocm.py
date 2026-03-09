@@ -15,7 +15,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_config_file_name,
 )
 
-padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
+padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 
 def main(model, tp_size, dtype: str, batches):
@@ -187,10 +187,8 @@ def run_grid(bs, model, method, tp_size, dtype: str):
 
     configs = union_of_list_of_dicts(prune_configs_1, prune_configs_2)
 
-    print(
-        f"{bs=} || {len(full_configs)=} | {len(prune_configs_1)=} | \
-            {len(prune_configs_2)=} | {len(configs)=}"
-    )
+    print(f"{bs=} || {len(full_configs)=} | {len(prune_configs_1)=} | \
+            {len(prune_configs_2)=} | {len(configs)=}")
 
     best_config = None
     best_time_us = 1e20

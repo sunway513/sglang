@@ -43,7 +43,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn.parameter import Parameter
-from transformers import PretrainedConfig
+from transformers import Cohere2Config, CohereConfig, PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -65,7 +65,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import get_compiler_backend, set_weight_attrs
+from sglang.srt.utils import add_prefix, get_compiler_backend, set_weight_attrs
 
 
 @torch.compile(backend=get_compiler_backend())
@@ -110,6 +110,7 @@ class CohereMLP(nn.Module):
         self,
         config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -120,12 +121,14 @@ class CohereMLP(nn.Module):
             [self.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             self.intermediate_size,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
         )
         self.act_fn = SiluAndMul()
 
@@ -142,6 +145,7 @@ class CohereAttention(nn.Module):
         config: PretrainedConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
@@ -177,12 +181,14 @@ class CohereAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -192,12 +198,25 @@ class CohereAttention(nn.Module):
             rope_scaling=self.rope_scaling,
             is_neox_style=False,
         )
+
+        self.v1 = isinstance(config, CohereConfig)
+        self.v2 = isinstance(config, Cohere2Config)
+
+        # Model v2 has interleaved sliding windows, v1 does not
+        if self.v2 and config.layer_types[layer_id] == "sliding_attention":
+            self.sliding_window_size = config.sliding_window
+        else:
+            self.sliding_window_size = -1
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=self.sliding_window_size,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
         if self.use_qk_norm:
             self.q_norm = LayerNorm(
@@ -227,7 +246,9 @@ class CohereAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
             q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        # Model v1 uses RoPE throughout, Model v2 uses RoPE only for SWA layers
+        if self.v1 or self.sliding_window_size > 0:
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -239,15 +260,23 @@ class CohereDecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
 
         self.self_attn = CohereAttention(
-            config, layer_id=layer_id, quant_config=quant_config
+            config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
         )
 
-        self.mlp = CohereMLP(config, quant_config=quant_config)
+        self.mlp = CohereMLP(
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
         self.input_layernorm = LayerNorm(
             param_shape=(config.hidden_size), eps=config.layer_norm_eps
         )
@@ -279,6 +308,7 @@ class CohereModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -288,7 +318,12 @@ class CohereModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                CohereDecoderLayer(config, i, quant_config=quant_config)
+                CohereDecoderLayer(
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -321,12 +356,16 @@ class CohereForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.logits_processor = LogitsProcessor(config)
-        self.model = CohereModel(config, quant_config)
+        self.logit_scale = getattr(config, "logit_scale", None)
+        self.logits_processor = LogitsProcessor(config, logit_scale=self.logit_scale)
+        self.model = CohereModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
 
     @torch.no_grad()
     def forward(
